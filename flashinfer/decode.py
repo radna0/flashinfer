@@ -1924,6 +1924,8 @@ class TrtllmGenDecodeModule:
             workspace_size,
             sinks,
             None,  # cum_seq_lens_q
+            None,  # k_cache_scales (FP4 KV cache)
+            None,  # v_cache_scales (FP4 KV cache)
         )
         return out
 
@@ -2087,6 +2089,8 @@ def trtllm_batch_decode_with_kv_cache(
     mask: Optional[torch.Tensor] = None,
     max_q_len: Optional[int] = None,
     cum_seq_lens_q: Optional[torch.Tensor] = None,
+    k_cache_scales: Optional[torch.Tensor] = None,
+    v_cache_scales: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -2170,6 +2174,14 @@ def trtllm_batch_decode_with_kv_cache(
         Only supported by trtllm-gen backend. Must be provided together with ``max_q_len``.
         When None, all requests use uniform query length specified by ``q_len_per_req``.
 
+    k_cache_scales : Optional[torch.Tensor] = None
+        Scale factors for FP4 K cache dequantization. Required when using FP4 (E2M1) KV cache.
+        Shape should match the KV cache scale factor layout.
+
+    v_cache_scales : Optional[torch.Tensor] = None
+        Scale factors for FP4 V cache dequantization. Required when using FP4 (E2M1) KV cache.
+        Shape should match the KV cache scale factor layout.
+
     Returns
     -------
     out : Union[torch.Tensor, FP4Tensor]
@@ -2183,9 +2195,9 @@ def trtllm_batch_decode_with_kv_cache(
         if kv_cache.shape[1] == 1:
             k_cache, v_cache = kv_cache, kv_cache
         else:
-            assert kv_cache.shape[1] == 2, (
-                "When kv_cache is a single tensor, the second dimension must be 1 or 2"
-            )
+            assert (
+                kv_cache.shape[1] == 2
+            ), "When kv_cache is a single tensor, the second dimension must be 1 or 2"
             # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
@@ -2240,9 +2252,9 @@ def trtllm_batch_decode_with_kv_cache(
         sm_count = get_device_sm_count(query.device)
 
         if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
-            assert query.dtype == torch.float8_e4m3fn, (
-                "query must be fp8 when out_dtype is nvfp4."
-            )
+            assert (
+                query.dtype == torch.float8_e4m3fn
+            ), "query must be fp8 when out_dtype is nvfp4."
             assert o_sf_scale is not None
             assert o_sf_vec_size in [None, 16], "only o_sf_vec_size = 16 is supported"
             o_sf_vec_size = o_sf_vec_size or 16
@@ -2350,6 +2362,8 @@ def trtllm_batch_decode_with_kv_cache(
             workspace_buffer.numel() * workspace_buffer.element_size(),
             sinks,
             cum_seq_lens_q,
+            k_cache_scales,  # FP4 KV cache scale factors
+            v_cache_scales,  # FP4 KV cache scale factors
         )
 
         return (
@@ -2447,9 +2461,9 @@ def xqa_batch_decode_with_kv_cache(
         if kv_cache.shape[1] == 1:
             k_cache, v_cache = kv_cache, kv_cache
         else:
-            assert kv_cache.shape[1] == 2, (
-                "When kv_cache is a single tensor, the second dimension must be 1 or 2"
-            )
+            assert (
+                kv_cache.shape[1] == 2
+            ), "When kv_cache is a single tensor, the second dimension must be 1 or 2"
             # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)

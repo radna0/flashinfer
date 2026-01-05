@@ -678,6 +678,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
             workspace_buffer.numel() * workspace_buffer.element_size(),
             sinks,
             None,  # cum_seq_lens_q
+            None,  # k_cache_scales (FP4 KV cache)
+            None,  # v_cache_scales (FP4 KV cache)
         )
 
         return out
