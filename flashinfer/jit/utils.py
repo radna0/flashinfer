@@ -43,6 +43,10 @@ dtype_map = {
     torch.uint64: "uint64_t",
 }
 
+# Add FP4 (E2M1) dtype if available (requires PyTorch with FP4 support)
+if hasattr(torch, "float4_e2m1fn_x2"):
+    dtype_map[torch.float4_e2m1fn_x2] = "__nv_fp4_e2m1"
+
 dtype_cutlass_map = {
     torch.float16: "cutlass::half_t",
     torch.bfloat16: "cutlass::bfloat16_t",
@@ -56,6 +60,10 @@ dtype_cutlass_map = {
     torch.uint64: "cutlass::uint64_t",
 }
 
+# Add FP4 (E2M1) dtype if available
+if hasattr(torch, "float4_e2m1fn_x2"):
+    dtype_cutlass_map[torch.float4_e2m1fn_x2] = "cutlass::float_e2m1_t"
+
 filename_safe_dtype_map = {
     torch.float16: "f16",
     torch.bfloat16: "bf16",
@@ -68,6 +76,10 @@ filename_safe_dtype_map = {
     torch.int64: "i64",
     torch.uint64: "u64",
 }
+
+# Add FP4 (E2M1) dtype if available
+if hasattr(torch, "float4_e2m1fn_x2"):
+    filename_safe_dtype_map[torch.float4_e2m1fn_x2] = "fp4"
 
 pos_encoding_mode_literal = {
     0: "PosEncodingMode::kNone",
