@@ -265,6 +265,15 @@ void trtllm_paged_attention_decode(TensorView out, Optional<TensorView> out_scal
   int kv_stride_keys_values = key_cache.stride(-2);  // key/values
   int kv_stride_heads = key_cache.stride(-3);        // head
   int kv_stride_batch = key_cache.stride(0);         // batch
+  // For FP4 (E2M1) KV cache, PyTorch uses uint8 as a 2xFP4 container (2 FP4 values per byte).
+  // TRT-LLM expects strides in units of *FP4 elements*, so convert strides from bytes to FP4
+  // elements by multiplying by 2. The kernel code will internally divide by 2 again when
+  // building TMA descriptors for the packed KV tensor.
+  if (is_4bit(kv_data_type)) {
+    kv_stride_keys_values *= 2;
+    kv_stride_heads *= 2;
+    kv_stride_batch *= 2;
+  }
 
   // Query stride: [num_tokens, num_heads, head_dim]
   int q_stride_tokens = query.stride(0);  // stride between tokens
@@ -353,6 +362,12 @@ void trtllm_paged_attention_context(
   int kv_stride_keys_values = key_cache.stride(-2);  // key/values
   int kv_stride_heads = key_cache.stride(-3);        // head
   int kv_stride_batch = key_cache.stride(0);         // batch
+  // See comment in trtllm_paged_attention_decode.
+  if (is_4bit(kv_data_type)) {
+    kv_stride_keys_values *= 2;
+    kv_stride_heads *= 2;
+    kv_stride_batch *= 2;
+  }
 
   // Query stride: [num_tokens, num_heads, head_dim]
   int q_stride_tokens = query.stride(0);  // stride between tokens

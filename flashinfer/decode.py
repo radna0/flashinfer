@@ -1195,6 +1195,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         return_lse: bool = False,
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
+        k_cache_scales: Optional[torch.Tensor] = None,
+        v_cache_scales: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         q_len_per_req: Optional[int] = 1,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -1248,6 +1250,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
+        if (k_cache_scales is not None or v_cache_scales is not None) and (
+            self._backend != "trtllm-gen"
+        ):
+            raise ValueError(
+                "k_cache_scales/v_cache_scales are only supported by trtllm-gen backend."
+            )
 
         if self._kv_layout == "NHD":
             page_size = k_cache.shape[1]
@@ -1358,6 +1366,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     self._max_kv_len,
                     sinks,
                 ]
+            if self._backend == "trtllm-gen":
+                run_args += [k_cache_scales, v_cache_scales]
 
             self._cached_module.paged_run(*run_args)
         else:
@@ -1905,6 +1915,8 @@ class TrtllmGenDecodeModule:
         enable_pdl: bool = None,
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        k_cache_scales: Optional[torch.Tensor] = None,
+        v_cache_scales: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if out is None:
             out = torch.empty_like(query)
@@ -1946,8 +1958,8 @@ class TrtllmGenDecodeModule:
             workspace_size,
             sinks,
             None,  # cum_seq_lens_q
-            None,  # k_cache_scales (FP4 KV cache)
-            None,  # v_cache_scales (FP4 KV cache)
+            k_cache_scales,
+            v_cache_scales,
         )
         return out
 
@@ -2009,6 +2021,8 @@ def get_trtllm_gen_decode_module(*args):
         page_size: Optional[int] = None,
         max_kv_len: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
+        k_cache_scales: Optional[torch.Tensor] = None,
+        v_cache_scales: Optional[torch.Tensor] = None,
     ) -> None:
         assert maybe_lse is None
         assert paged_kv_cache is not None
@@ -2035,6 +2049,8 @@ def get_trtllm_gen_decode_module(*args):
             enable_pdl,
             out=o,
             sinks=sinks,
+            k_cache_scales=k_cache_scales,
+            v_cache_scales=v_cache_scales,
         )
 
     @register_fake_op(f"flashinfer::{uri}_paged_run")
@@ -2074,6 +2090,8 @@ def get_trtllm_gen_decode_module(*args):
         page_size: Optional[int] = None,
         max_kv_len: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
+        k_cache_scales: Optional[torch.Tensor] = None,
+        v_cache_scales: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 

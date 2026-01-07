@@ -225,6 +225,8 @@ def get_trtllm_gen_prefill_module():
         window_left: int = -1,
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        k_cache_scales: Optional[torch.Tensor] = None,
+        v_cache_scales: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         sm_count = get_device_sm_count(query.device)
         if out is None:
@@ -258,6 +260,8 @@ def get_trtllm_gen_prefill_module():
             enable_pdl,
             workspace_size,
             sinks,
+            k_cache_scales,
+            v_cache_scales,
         )
         return out
 
@@ -642,6 +646,8 @@ def get_batch_prefill_module(backend, *args):
         cum_seq_lens_q: Optional[torch.Tensor] = None,
         cum_seq_lens_kv: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        k_cache_scales: Optional[torch.Tensor] = None,
+        v_cache_scales: Optional[torch.Tensor] = None,
     ) -> None:
         if backend == "trtllm-gen":
             assert maybe_lse is None
@@ -675,6 +681,8 @@ def get_batch_prefill_module(backend, *args):
                 window_left,
                 out=o,
                 sinks=sinks,
+                k_cache_scales=k_cache_scales,
+                v_cache_scales=v_cache_scales,
             )
         elif backend == "fa2":
             assert not is_float8(q)
@@ -806,6 +814,9 @@ def get_batch_prefill_module(backend, *args):
         batch_size: Optional[int] = None,
         cum_seq_lens_q: Optional[torch.Tensor] = None,
         cum_seq_lens_kv: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
+        k_cache_scales: Optional[torch.Tensor] = None,
+        v_cache_scales: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 
@@ -2022,6 +2033,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
+        sinks: Optional[torch.Tensor] = None,
+        k_cache_scales: Optional[torch.Tensor] = None,
+        v_cache_scales: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""Warning: This function is deprecated, please use :meth:`run` instead."""
         self._causal = causal
@@ -2032,7 +2046,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
-        return self.run(q, paged_kv_cache, k_scale=k_scale, v_scale=v_scale)
+        return self.run(
+            q,
+            paged_kv_cache,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            sinks=sinks,
+            k_cache_scales=k_cache_scales,
+            v_cache_scales=v_cache_scales,
+        )
 
     @overload
     def run(
@@ -2078,6 +2100,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         return_lse: bool = False,
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
+        k_cache_scales: Optional[torch.Tensor] = None,
+        v_cache_scales: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and paged kv-cache.
@@ -2129,6 +2153,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
+        if (k_cache_scales is not None or v_cache_scales is not None) and (
+            self._backend != "trtllm-gen"
+        ):
+            raise ValueError(
+                "k_cache_scales/v_cache_scales are only supported by trtllm-gen backend."
+            )
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
@@ -2289,6 +2319,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 ]
 
             assert self._cached_module is not None, "cached module is not initialized"
+            if self._backend == "trtllm-gen":
+                run_args += [k_cache_scales, v_cache_scales]
             self._cached_module.paged_run(*run_args)
             if v_scale is not None:
                 # TODO(Zihao): fused into kernel
