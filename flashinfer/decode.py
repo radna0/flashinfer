@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 import math
+import warnings
 from types import SimpleNamespace
 from typing import Any, List, Literal, Optional, Tuple, Union, overload
 
@@ -63,6 +64,7 @@ from .utils import (
     _get_range_buf,
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
+    determine_attention_backend,
     device_support_pdl,
     get_device_sm_count,
     is_float8,
@@ -834,6 +836,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         logits_soft_cap: Optional[float] = None,
         q_data_type: Optional[Union[str, torch.dtype]] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        o_data_type: Optional[Union[str, torch.dtype]] = None,
         data_type: Optional[Union[str, torch.dtype]] = None,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
@@ -966,6 +969,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if kv_data_type is None:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        if o_data_type is None:
+            o_data_type = q_data_type
+        o_data_type = canonicalize_torch_dtype(o_data_type)
         if fixed_split_size is not None and not self.use_tensor_cores:
             raise ValueError(
                 "fixed_split_size is only supported by tensor core decode for now."
@@ -975,6 +981,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
+        self._cached_o_data_type = o_data_type
         self._batch_size = batch_size
         self._num_qo_heads = num_qo_heads
         self._num_kv_heads = num_kv_heads
@@ -1029,11 +1036,20 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if self._jit_module is not None:
                 self._cached_module = self._jit_module
             else:
+                if self._backend == "auto":
+                    self._backend = determine_attention_backend(
+                        self.device,
+                        PosEncodingMode[pos_encoding_mode].value,
+                        False,  # use_fp16_qk_reduction
+                        False,  # use_custom_mask
+                        q_data_type,
+                        kv_data_type,
+                    )
                 self._cached_module = get_batch_prefill_module(
-                    "fa2",
+                    self._backend,
                     q_data_type,
                     kv_data_type,
-                    q_data_type,
+                    o_data_type,
                     indptr.dtype,
                     head_dim,  # head_dim_qk
                     head_dim,  # head_dim_vo
@@ -1043,7 +1059,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     False,  # use_fp16_qk_reduction
                 )
 
-            self._plan_info = self._cached_module.plan(
+            args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 self._pin_memory_int_workspace_buffer,
@@ -1060,10 +1076,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 head_dim,
                 False,  # causal
                 window_left,
-                fixed_split_size,
-                disable_split_kv,
-                0,  # num_colocated_ctas
-            )
+            ]
+            if self._backend == "fa2":
+                args.append(fixed_split_size)
+                args.append(disable_split_kv)
+                args.append(0)  # num_colocated_ctas
+            self._plan_info = self._cached_module.plan(*args)
         else:
             if self._jit_module is not None:
                 self._cached_module = self._jit_module
@@ -1281,14 +1299,18 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 )
 
         if out is None:
-            out = torch.empty_like(q)
+            out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
+            out = torch.empty(
+                q.shape[:-1] + v_cache.shape[-1:], dtype=out_dtype, device=q.device
+            )
         else:
-            check_shape_dtype_device(out, q.shape, q.dtype, q.device, "out")
+            out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
+            check_shape_dtype_device(out, q.shape, out_dtype, q.device, "out")
 
         if self._backend == "trtllm-gen":
             q = q.view(q.size(0) // q_len_per_req, q_len_per_req, q.size(1), q.size(2))
 
-        if self.use_tensor_cores:
+        if self.use_tensor_cores and hasattr(self._cached_module, "paged_run"):
             run_args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
@@ -2571,7 +2593,9 @@ def fast_decode_plan(
     if kv_data_type is None:
         kv_data_type = q_data_type
 
-    if self.use_tensor_cores:
+    use_tensor_cores = self.use_tensor_cores
+
+    if use_tensor_cores:
         qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
         # Here we set fixed_split_size to -1 to avoid the assertion error in flashinfer's plan function
         if fixed_split_size is None:
@@ -2593,7 +2617,7 @@ def fast_decode_plan(
         self._paged_kv_indptr_buf = indptr
         self._paged_kv_indices_buf = indices
         self._paged_kv_last_page_len_buf = last_page_len
-        if self.use_tensor_cores:
+        if use_tensor_cores:
             self._qo_indptr_buf = qo_indptr_host.to(
                 self.device, non_blocking=non_blocking
             )
@@ -2623,8 +2647,9 @@ def fast_decode_plan(
         else indptr.cpu()
     )
 
+    plan_error = None
     with torch.cuda.device(self.device):
-        if self.use_tensor_cores:
+        if use_tensor_cores:
             # ALSO convert last_page_len to CPU
             if page_size == 1:
                 # When page size is 1, last_page_len is always 1.
@@ -2661,8 +2686,14 @@ def fast_decode_plan(
                     0,  # num_colocated_ctas
                 )
             except Exception as e:
-                raise RuntimeError(f"Error in standard plan: {e}") from e
-        else:
+                plan_error = e
+                use_tensor_cores = False
+                warnings.warn(
+                    "Tensor core decode plan failed; falling back to standard plan signature.",
+                    RuntimeWarning,
+                )
+
+        if (not use_tensor_cores) or plan_error is not None:
             try:
                 # Make sure we pass exactly 15 arguments for standard version
                 self._plan_info = self._cached_module.plan(
@@ -2683,6 +2714,10 @@ def fast_decode_plan(
                     empty_kv_cache,
                 )
             except Exception as e:
+                if plan_error is not None:
+                    raise RuntimeError(
+                        f"Error in tensor-core plan: {plan_error}; fallback failed: {e}"
+                    ) from e
                 raise RuntimeError(f"Error in standard plan: {e}") from e
 
     self._pos_encoding_mode = pos_encoding_mode

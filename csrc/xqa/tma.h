@@ -27,7 +27,21 @@
 #endif
 #include "barriers.cuh"
 
-enum class StateSpace { kCONSTANT, kPARAMETER, kGENERIC };
+enum class StateSpace { kCONSTANT, kPARAMETER, kGENERIC, kSHARED };
+
+__device__ inline uint64_t getTensorMapAddr(CUtensorMap const& tensorMap, StateSpace loc) {
+  switch (loc) {
+    case StateSpace::kCONSTANT:
+      return __cvta_generic_to_constant(&tensorMap);
+    case StateSpace::kPARAMETER:
+      return __cvta_generic_to_grid_constant(&tensorMap);
+    case StateSpace::kSHARED:
+      return __cvta_generic_to_shared(&tensorMap);
+    case StateSpace::kGENERIC:
+    default:
+      return __cvta_generic_to_global(&tensorMap);
+  }
+}
 
 #ifdef GENERATE_CUBIN
 #define CU_TENSOR_MAP_NUM_QWORDS 16
@@ -49,14 +63,14 @@ __device__ inline void loadLinearAsync(void* dst, void const* src, uint32_t nbBy
   asm volatile(
       "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
       :
-      : "l"(__cvta_generic_to_shared(dst)), "l"(reinterpret_cast<uint64_t>(src)), "r"(nbBytes),
+      : "l"(__cvta_generic_to_shared(dst)), "l"(__cvta_generic_to_global(src)), "r"(nbBytes),
         "l"(__cvta_generic_to_shared(&bar))
       : "memory");
 }
 
 __device__ inline void prefetchLinear(void const* src, uint32_t nbBytes) {
   asm volatile(
-      "cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(reinterpret_cast<uint64_t>(src)),
+      "cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(__cvta_generic_to_global(src)),
       "r"(nbBytes)
       : "memory");
 }
@@ -68,30 +82,31 @@ __device__ inline void sm2smCopyAsync(void* dst, void const* src, uint32_t nbByt
       "cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes [%0], [%1], %2, "
       "[%3];\n"
       :
-      : "l"(__cvta_generic_to_shared(dst)), "l"(reinterpret_cast<uint64_t>(src)), "r"(nbBytes),
+      : "l"(__cvta_generic_to_shared(dst)), "l"(__cvta_generic_to_shared(src)), "r"(nbBytes),
         "l"(__cvta_generic_to_shared(&bar))
       : "memory");
 }
 
 template <uint32_t nbDims>
 __device__ inline void loadAsync(void* dst, CUtensorMap const& tensorMap, DimsLE<nbDims> offset,
-                                 CtaBarrier& bar) {
+                                 CtaBarrier& bar, StateSpace loc = StateSpace::kGENERIC) {
+  uint64_t const tensorMapAddr = getTensorMapAddr(tensorMap, loc);
   if constexpr (nbDims == 1) {
     // nbDims==1 does not need tensormap and should just use cp.async.bulk
     asm volatile(
         "cp.async.bulk.tensor.1d.shared::cta.global.mbarrier::complete_tx::bytes.tile [%0], [%1, "
         "{%2}], [%3];\n"
         :
-        : "l"(__cvta_generic_to_shared(dst)), "l"(reinterpret_cast<uint64_t>(&tensorMap)),
-          "r"(offset[0]), "l"(__cvta_generic_to_shared(&bar))
+        : "l"(__cvta_generic_to_shared(dst)), "l"(tensorMapAddr), "r"(offset[0]),
+          "l"(__cvta_generic_to_shared(&bar))
         : "memory");
   } else if constexpr (nbDims == 2) {
     asm volatile(
         "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.tile [%0], [%1, "
         "{%2, %3}], [%4];\n"
         :
-        : "l"(__cvta_generic_to_shared(dst)), "l"(reinterpret_cast<uint64_t>(&tensorMap)),
-          "r"(offset[0]), "r"(offset[1]), "l"(__cvta_generic_to_shared(&bar))
+        : "l"(__cvta_generic_to_shared(dst)), "l"(tensorMapAddr), "r"(offset[0]),
+          "r"(offset[1]), "l"(__cvta_generic_to_shared(&bar))
         : "memory");
   } else if constexpr (nbDims == 3) {
     asm volatile(
@@ -99,8 +114,8 @@ __device__ inline void loadAsync(void* dst, CUtensorMap const& tensorMap, DimsLE
         "{%2, %3, %4}], "
         "[%5];\n"
         :
-        : "l"(__cvta_generic_to_shared(dst)), "l"(reinterpret_cast<uint64_t>(&tensorMap)),
-          "r"(offset[0]), "r"(offset[1]), "r"(offset[2]), "l"(__cvta_generic_to_shared(&bar))
+        : "l"(__cvta_generic_to_shared(dst)), "l"(tensorMapAddr), "r"(offset[0]),
+          "r"(offset[1]), "r"(offset[2]), "l"(__cvta_generic_to_shared(&bar))
         : "memory");
   } else if constexpr (nbDims == 4) {
     asm volatile(
@@ -108,9 +123,8 @@ __device__ inline void loadAsync(void* dst, CUtensorMap const& tensorMap, DimsLE
         "{%2, %3, %4, "
         "%5}], [%6];\n"
         :
-        : "l"(__cvta_generic_to_shared(dst)), "l"(reinterpret_cast<uint64_t>(&tensorMap)),
-          "r"(offset[0]), "r"(offset[1]), "r"(offset[2]), "r"(offset[3]),
-          "l"(__cvta_generic_to_shared(&bar))
+        : "l"(__cvta_generic_to_shared(dst)), "l"(tensorMapAddr), "r"(offset[0]),
+          "r"(offset[1]), "r"(offset[2]), "r"(offset[3]), "l"(__cvta_generic_to_shared(&bar))
         : "memory");
   } else if constexpr (nbDims == 5) {
     asm volatile(
@@ -118,8 +132,8 @@ __device__ inline void loadAsync(void* dst, CUtensorMap const& tensorMap, DimsLE
         "{%2, %3, %4, %5, "
         "%6}], [%7];\n"
         :
-        : "l"(__cvta_generic_to_shared(dst)), "l"(reinterpret_cast<uint64_t>(&tensorMap)),
-          "r"(offset[0]), "r"(offset[1]), "r"(offset[2]), "r"(offset[3]), "r"(offset[4]),
+        : "l"(__cvta_generic_to_shared(dst)), "l"(tensorMapAddr), "r"(offset[0]),
+          "r"(offset[1]), "r"(offset[2]), "r"(offset[3]), "r"(offset[4]),
           "l"(__cvta_generic_to_shared(&bar))
         : "memory");
   } else {
@@ -129,7 +143,9 @@ __device__ inline void loadAsync(void* dst, CUtensorMap const& tensorMap, DimsLE
 
 template <uint32_t nbDims>
 __device__ inline void loadAsync(void* dst, CUtensorMap const& tensorMap, DimsLE<nbDims> offset,
-                                 CtaBarrier& bar, uint64_t cacheHint) {
+                                 CtaBarrier& bar, uint64_t cacheHint,
+                                 StateSpace loc = StateSpace::kGENERIC) {
+  uint64_t const tensorMapAddr = getTensorMapAddr(tensorMap, loc);
   if constexpr (nbDims == 1) {
     // nbDims==1 does not need tensormap and should just use cp.async.bulk
     asm volatile(
@@ -137,8 +153,8 @@ __device__ inline void loadAsync(void* dst, CUtensorMap const& tensorMap, DimsLE
         "hint [%0], [%1, "
         "{%2}], [%3], %4;\n"
         :
-        : "l"(__cvta_generic_to_shared(dst)), "l"(reinterpret_cast<uint64_t>(&tensorMap)),
-          "r"(offset[0]), "l"(__cvta_generic_to_shared(&bar)), "l"(cacheHint)
+        : "l"(__cvta_generic_to_shared(dst)), "l"(tensorMapAddr), "r"(offset[0]),
+          "l"(__cvta_generic_to_shared(&bar)), "l"(cacheHint)
         : "memory");
   } else if constexpr (nbDims == 2) {
     asm volatile(
@@ -146,8 +162,8 @@ __device__ inline void loadAsync(void* dst, CUtensorMap const& tensorMap, DimsLE
         "hint [%0], [%1, "
         "{%2, %3}], [%4], %5;\n"
         :
-        : "l"(__cvta_generic_to_shared(dst)), "l"(reinterpret_cast<uint64_t>(&tensorMap)),
-          "r"(offset[0]), "r"(offset[1]), "l"(__cvta_generic_to_shared(&bar)), "l"(cacheHint)
+        : "l"(__cvta_generic_to_shared(dst)), "l"(tensorMapAddr), "r"(offset[0]),
+          "r"(offset[1]), "l"(__cvta_generic_to_shared(&bar)), "l"(cacheHint)
         : "memory");
   } else if constexpr (nbDims == 3) {
     asm volatile(
@@ -155,8 +171,8 @@ __device__ inline void loadAsync(void* dst, CUtensorMap const& tensorMap, DimsLE
         "hint [%0], [%1, "
         "{%2, %3, %4}], [%5], %6;\n"
         :
-        : "l"(__cvta_generic_to_shared(dst)), "l"(reinterpret_cast<uint64_t>(&tensorMap)),
-          "r"(offset[0]), "r"(offset[1]), "r"(offset[2]), "l"(__cvta_generic_to_shared(&bar)),
+        : "l"(__cvta_generic_to_shared(dst)), "l"(tensorMapAddr), "r"(offset[0]),
+          "r"(offset[1]), "r"(offset[2]), "l"(__cvta_generic_to_shared(&bar)),
           "l"(cacheHint)
         : "memory");
   } else if constexpr (nbDims == 4) {
@@ -165,9 +181,9 @@ __device__ inline void loadAsync(void* dst, CUtensorMap const& tensorMap, DimsLE
         "hint [%0], [%1, "
         "{%2, %3, %4, %5}], [%6], %7;\n"
         :
-        : "l"(__cvta_generic_to_shared(dst)), "l"(reinterpret_cast<uint64_t>(&tensorMap)),
-          "r"(offset[0]), "r"(offset[1]), "r"(offset[2]), "r"(offset[3]),
-          "l"(__cvta_generic_to_shared(&bar)), "l"(cacheHint)
+        : "l"(__cvta_generic_to_shared(dst)), "l"(tensorMapAddr), "r"(offset[0]),
+          "r"(offset[1]), "r"(offset[2]), "r"(offset[3]), "l"(__cvta_generic_to_shared(&bar)),
+          "l"(cacheHint)
         : "memory");
   } else if constexpr (nbDims == 5) {
     asm volatile(
@@ -175,8 +191,8 @@ __device__ inline void loadAsync(void* dst, CUtensorMap const& tensorMap, DimsLE
         "hint [%0], [%1, "
         "{%2, %3, %4, %5, %6}], [%7], %8;\n"
         :
-        : "l"(__cvta_generic_to_shared(dst)), "l"(reinterpret_cast<uint64_t>(&tensorMap)),
-          "r"(offset[0]), "r"(offset[1]), "r"(offset[2]), "r"(offset[3]), "r"(offset[4]),
+        : "l"(__cvta_generic_to_shared(dst)), "l"(tensorMapAddr), "r"(offset[0]),
+          "r"(offset[1]), "r"(offset[2]), "r"(offset[3]), "r"(offset[4]),
           "l"(__cvta_generic_to_shared(&bar)), "l"(cacheHint)
         : "memory");
   } else {
@@ -194,42 +210,41 @@ __device__ inline void store1DAsync(void* dst, void const* src, uint32_t nbBytes
 
 template <uint32_t nbDims>
 __device__ inline void storeAsync(CUtensorMap const& tensorMap, DimsLE<nbDims> const& offset,
-                                  void* src) {
+                                  void* src, StateSpace loc = StateSpace::kGENERIC) {
+  uint64_t const tensorMapAddr = getTensorMapAddr(tensorMap, loc);
   if constexpr (nbDims == 1) {
     // nbDims==1 does not need tensormap and should just use cp.async.bulk
     asm volatile("cp.async.bulk.tensor.1d.global.shared::cta.bulk_group.tile [%0, {%1}], [%2];\n"
                  :
-                 : "l"(reinterpret_cast<uint64_t>(&tensorMap)), "r"(offset[0]),
-                   "l"(__cvta_generic_to_shared(src))
+                 : "l"(tensorMapAddr), "r"(offset[0]), "l"(__cvta_generic_to_shared(src))
                  : "memory");
   } else if constexpr (nbDims == 2) {
     asm volatile(
         "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group.tile [%0, {%1, %2}], [%3];\n"
         :
-        : "l"(reinterpret_cast<uint64_t>(&tensorMap)), "r"(offset[0]), "r"(offset[1]),
-          "l"(__cvta_generic_to_shared(src))
+        : "l"(tensorMapAddr), "r"(offset[0]), "r"(offset[1]), "l"(__cvta_generic_to_shared(src))
         : "memory");
   } else if constexpr (nbDims == 3) {
     asm volatile(
         "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group.tile [%0, {%1, %2, %3}], [%4];\n"
         :
-        : "l"(reinterpret_cast<uint64_t>(&tensorMap)), "r"(offset[0]), "r"(offset[1]),
-          "r"(offset[2]), "l"(__cvta_generic_to_shared(src))
+        : "l"(tensorMapAddr), "r"(offset[0]), "r"(offset[1]), "r"(offset[2]),
+          "l"(__cvta_generic_to_shared(src))
         : "memory");
   } else if constexpr (nbDims == 4) {
     asm volatile(
         "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group.tile [%0, {%1, %2, %3, %4}], [%5];\n"
         :
-        : "l"(reinterpret_cast<uint64_t>(&tensorMap)), "r"(offset[0]), "r"(offset[1]),
-          "r"(offset[2]), "r"(offset[3]), "l"(__cvta_generic_to_shared(src))
+        : "l"(tensorMapAddr), "r"(offset[0]), "r"(offset[1]), "r"(offset[2]), "r"(offset[3]),
+          "l"(__cvta_generic_to_shared(src))
         : "memory");
   } else if constexpr (nbDims == 5) {
     asm volatile(
         "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group.tile [%0, {%1, %2, %3, %4, %5}], "
         "[%6];\n"
         :
-        : "l"(reinterpret_cast<uint64_t>(&tensorMap)), "r"(offset[0]), "r"(offset[1]),
-          "r"(offset[2]), "r"(offset[3]), "r"(offset[4]), "l"(__cvta_generic_to_shared(src))
+        : "l"(tensorMapAddr), "r"(offset[0]), "r"(offset[1]), "r"(offset[2]), "r"(offset[3]),
+          "r"(offset[4]), "l"(__cvta_generic_to_shared(src))
         : "memory");
   } else {
     static_assert(nbDims >= 1 && nbDims <= 5);
@@ -267,7 +282,7 @@ __device__ inline void prefetchTensorMap(CUtensorMap const& tensorMap,
           : "memory");
       break;
     case StateSpace::kGENERIC:
-      asm volatile("prefetch.tensormap [%0];\n" ::"l"(reinterpret_cast<uint64_t>(&tensorMap))
+      asm volatile("prefetch.tensormap [%0];\n" ::"l"(__cvta_generic_to_global(&tensorMap))
                    : "memory");
       break;
     default:

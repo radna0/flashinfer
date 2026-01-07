@@ -123,15 +123,17 @@ __device__ inline void KVTilePartLoader::loadData(
     assert(nbPagesPerTile == 1);
     uint32_t const offset = nbTokens * (idxTile % exactDiv(tokensPerPage, nbTokens));
     if (warpElectSync()) {
-      tma::loadAsync(&dst, tensorMap, DimsLE<4>{idxElemBeg, idxHeadGrp, offset, (uint32_t)pages[0]},
-                     bar);
+      tma::loadAsync(&dst, tensorMap,
+                     DimsLE<4>{idxElemBeg, idxHeadGrp, offset, (uint32_t)pages[0]}, bar,
+                     StateSpace::kPARAMETER);
     }
   } else {
 #pragma unroll
     for (uint32_t i = 0; i < nbPagesPerTile; i++) {
       if (warpElectSync()) {
         tma::loadAsync(&dst(tokensPerPage * i, 0), tensorMap,
-                       DimsLE<4>{idxElemBeg, idxHeadGrp, 0, (uint32_t)pages[i]}, bar);
+                       DimsLE<4>{idxElemBeg, idxHeadGrp, 0, (uint32_t)pages[i]}, bar,
+                       StateSpace::kPARAMETER);
       }
     }
   }
@@ -552,7 +554,7 @@ struct Producer {
       if (warpElectSync()) {
         tma::loadAsync(&smem.q[regQPartShmBeg + i], args.tensorMapQ,
                        DimsLE<2>{partElemsK * i, headGrpSize * idxInputTokenGlobal},
-                       smem.regQBar.produced);
+                       smem.regQBar.produced, StateSpace::kPARAMETER);
       }
     }
     if (warpElectSync()) {
@@ -570,7 +572,7 @@ struct Producer {
       if (warpElectSync()) {
         tma::loadAsync(&smem.q[i], args.tensorMapQ,
                        DimsLE<2>{partElemsK * idxPart, headGrpSize * idxInputTokenGlobal},
-                       smem.shmQBar);
+                       smem.shmQBar, StateSpace::kPARAMETER);
       }
     }
     if (warpElectSync()) {

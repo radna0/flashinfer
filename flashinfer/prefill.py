@@ -25,10 +25,12 @@ import torch
 from .api_logging import flashinfer_api
 from .jit import (
     gen_batch_prefill_module,
+    gen_batch_prefill_attention_sink_module,
     gen_customize_batch_prefill_module,
     gen_fmha_cutlass_sm100a_module,
     gen_single_prefill_module,
     get_batch_prefill_uri,
+    get_batch_prefill_attention_sink_uri,
     get_single_prefill_uri,
     setup_cubin_loader,
     gen_trtllm_gen_fmha_module,
@@ -389,6 +391,23 @@ def get_single_prefill_module(backend, *args):
 
     # Register the module
     return SimpleNamespace(run=run_single_prefill)
+
+
+@functools.cache
+def get_batch_prefill_attention_sink_module(backend, *args):
+    uri = get_batch_prefill_attention_sink_uri(backend, *args)
+    module = gen_batch_prefill_attention_sink_module(backend, *args).build_and_load()
+    plan_func = module.plan
+    ragged_run_func = module.ragged_run
+    paged_run_func = module.paged_run
+
+    return SimpleNamespace(
+        module=module,
+        uri=uri,
+        plan=plan_func,
+        ragged_run=ragged_run_func,
+        paged_run=paged_run_func,
+    )
 
 
 @functools.cache
@@ -1941,9 +1960,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 block_id = paged_kv_indptr_host[0]
                 for i in range(batch_size):
                     num_blocks_needed = blocks_per_seq[i]
-                    assert self._block_tables is not None, (
-                        "block_tables is not initialized"
-                    )
+                    assert (
+                        self._block_tables is not None
+                    ), "block_tables is not initialized"
                     self._block_tables[i, :num_blocks_needed] = paged_kv_indices[
                         block_id : block_id + num_blocks_needed
                     ]
@@ -3396,9 +3415,9 @@ def trtllm_ragged_attention_deepseek(
         If return_lse is True, the output will be a tuple of two tensors, the first is the output tensor, the second is the lse tensor.
         If return_lse is False, the output will be a single tensor.
     """
-    assert query.shape[2] == 192 and key.shape[2] == 192 and value.shape[2] == 128, (
-        "currently only support deepseek r1 192 query and 128 value"
-    )
+    assert (
+        query.shape[2] == 192 and key.shape[2] == 192 and value.shape[2] == 128
+    ), "currently only support deepseek r1 192 query and 128 value"
 
     if enable_pdl is None:
         enable_pdl = device_support_pdl(query.device)
@@ -3479,6 +3498,8 @@ def trtllm_batch_context_with_kv_cache(
     kv_layout: str = "HND",
     enable_pdl: Optional[bool] = None,
     sinks: Optional[List[torch.Tensor]] = None,
+    k_cache_scales: Optional[torch.Tensor] = None,
+    v_cache_scales: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -3547,9 +3568,9 @@ def trtllm_batch_context_with_kv_cache(
         if kv_cache.shape[1] == 1:
             k_cache, v_cache = kv_cache, kv_cache
         else:
-            assert kv_cache.shape[1] == 2, (
-                "When kv_cache is a single tensor, the second dimension must be 1 or 2"
-            )
+            assert (
+                kv_cache.shape[1] == 2
+            ), "When kv_cache is a single tensor, the second dimension must be 1 or 2"
             # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
@@ -3564,9 +3585,9 @@ def trtllm_batch_context_with_kv_cache(
     sm_count = get_device_sm_count(query.device)
 
     if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
-        assert query.dtype == torch.float8_e4m3fn, (
-            "query must be fp8 when out_dtype is nvfp4."
-        )
+        assert (
+            query.dtype == torch.float8_e4m3fn
+        ), "query must be fp8 when out_dtype is nvfp4."
         assert o_sf_scale is not None
         assert o_sf_vec_size in [None, 16], "only o_sf_vec_size = 16 is supported"
         o_sf_vec_size = o_sf_vec_size or 16
@@ -3665,6 +3686,8 @@ def trtllm_batch_context_with_kv_cache(
         enable_pdl,
         workspace_size,
         sinks,
+        k_cache_scales,
+        v_cache_scales,
     )
     return (
         out
@@ -3724,9 +3747,9 @@ def fmha_v2_prefill_deepseek(
     """
     if not is_sm120a_supported(query.device):
         raise ValueError("fmha_v2_prefill_deepseek is only supported on SM120 GPUs.")
-    assert query.shape[3] == 192 and key.shape[3] == 192 and value.shape[3] == 128, (
-        "currently only support deepseek r1 192 query and 128 value"
-    )
+    assert (
+        query.shape[3] == 192 and key.shape[3] == 192 and value.shape[3] == 128
+    ), "currently only support deepseek r1 192 query and 128 value"
     module = get_trtllm_fmha_v2_module()
     is_e4m3 = query.dtype == torch.float8_e4m3fn
     is_bf16_output = out.dtype == torch.bfloat16
