@@ -22,6 +22,47 @@ namespace flashinfer {
 
 using namespace cute;
 
+namespace detail {
+
+template <bool FORCE_MAJOR_K, typename DTypeQ, typename DTypeKV, typename DTypeQKAccum, typename TileShape_QKD,
+          typename AtomLayoutQKD>
+struct TiledMmaQKSelector;
+
+template <typename DTypeQ, typename DTypeKV, typename DTypeQKAccum, typename TileShape_QKD, typename AtomLayoutQKD>
+struct TiledMmaQKSelector<false, DTypeQ, DTypeKV, DTypeQKAccum, TileShape_QKD, AtomLayoutQKD> {
+  using type = decltype(cute::make_tiled_mma(
+      cute::GMMA::ss_op_selector<DTypeQ, DTypeKV, DTypeQKAccum, TileShape_QKD>(), AtomLayoutQKD{}));
+};
+
+template <typename DTypeQ, typename DTypeKV, typename DTypeQKAccum, typename TileShape_QKD, typename AtomLayoutQKD>
+struct TiledMmaQKSelector<true, DTypeQ, DTypeKV, DTypeQKAccum, TileShape_QKD, AtomLayoutQKD> {
+  using type = decltype(cute::make_tiled_mma(
+      cute::GMMA::ss_op_selector<DTypeQ, DTypeKV, DTypeQKAccum, TileShape_QKD, GMMA::Major::K,
+                                 GMMA::Major::K>(),
+      AtomLayoutQKD{}));
+};
+
+template <bool FORCE_MAJOR_K, typename DTypeKV, typename TileShape_PDV, typename AtomLayoutQKD>
+struct TiledMmaPVSelector;
+
+template <typename DTypeKV, typename TileShape_PDV, typename AtomLayoutQKD>
+struct TiledMmaPVSelector<false, DTypeKV, TileShape_PDV, AtomLayoutQKD> {
+  using type = decltype(cute::make_tiled_mma(
+      cute::GMMA::rs_op_selector<DTypeKV, DTypeKV, /*ElementAccum=*/float, TileShape_PDV, GMMA::Major::K,
+                                 GMMA::Major::MN>(),
+      AtomLayoutQKD{}));
+};
+
+template <typename DTypeKV, typename TileShape_PDV, typename AtomLayoutQKD>
+struct TiledMmaPVSelector<true, DTypeKV, TileShape_PDV, AtomLayoutQKD> {
+  using type = decltype(cute::make_tiled_mma(
+      cute::GMMA::rs_op_selector<DTypeKV, DTypeKV, /*ElementAccum=*/float, TileShape_PDV, GMMA::Major::K,
+                                 GMMA::Major::K>(),
+      AtomLayoutQKD{}));
+};
+
+}  // namespace detail
+
 template <typename MainloopPipeline, class DTypeQ, class DTypeKV, class DTypeOut, class IdType,
           int CTA_KV, class SmemLayoutQ, class SmemLayoutK, class SmemLayoutV, class SmemLayoutO>
 struct SharedStorageQKVO {
@@ -72,12 +113,19 @@ struct AttentionKernelTraits {
   static constexpr int NUM_STAGES = NUM_STAGES_;
 
   using AtomLayoutQKD = Layout<Shape<Int<CTA_Q / 64>, _1, _1>>;
-  using TiledMmaQK = decltype(cute::make_tiled_mma(
-      cute::GMMA::ss_op_selector<DTypeQ, DTypeKV, DTypeQKAccum, TileShape_QKD>(), AtomLayoutQKD{}));
-  using TiledMmaPV = decltype(cute::make_tiled_mma(
-      cute::GMMA::rs_op_selector<DTypeKV, DTypeKV, /*ElementAccum=*/float, TileShape_PDV,
-                                 GMMA::Major::K, GMMA::Major::MN>(),
-      AtomLayoutQKD{}));
+  // Some FP8 KV-cache paths require forcing GMMA major-K for both operands.
+  //
+  // NOTE: DTypeKV is a Cutlass type (via cutlass_dtype_t<...>), so check against
+  // Cutlass FP8 types, not CUDA's __nv_fp8_*.
+  static constexpr bool FORCE_GMMA_MAJOR_K_FOR_KV =
+      std::is_same_v<DTypeKV, cutlass::float_e4m3_t> ||
+      std::is_same_v<DTypeKV, cutlass::float_e5m2_t>;
+
+  using TiledMmaQK =
+      typename detail::TiledMmaQKSelector<FORCE_GMMA_MAJOR_K_FOR_KV, DTypeQ, DTypeKV, DTypeQKAccum, TileShape_QKD,
+                                          AtomLayoutQKD>::type;
+  using TiledMmaPV =
+      typename detail::TiledMmaPVSelector<FORCE_GMMA_MAJOR_K_FOR_KV, DTypeKV, TileShape_PDV, AtomLayoutQKD>::type;
 
   static constexpr int NUM_MMA_THREADS = size(TiledMmaQK{});
 

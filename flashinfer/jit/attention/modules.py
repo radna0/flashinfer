@@ -984,6 +984,13 @@ def gen_batch_prefill_module(
     # KV-only quant is not influenced by this flag
     fp8_enabled = dtype_q in [torch.float8_e4m3fn, torch.float8_e5m2]
 
+    assert backend in ["fa2", "fa3"], (
+        f"backend must be fa2 or fa3 in gen_batch_prefill_module(), got: {backend}"
+    )
+    assert dtype_o not in [torch.float8_e4m3fn, torch.float8_e5m2], (
+        "FP8 output is not supported in fa2/fa3 backends yet"
+    )
+
     if backend == "fa2":
         assert not fp8_enabled, "fp8 tensor core is not supported in fa2 backend"
         additional_tensor_names = [
@@ -1095,6 +1102,11 @@ def gen_batch_prefill_attention_sink_module(
         use_sliding_window,
     )
 
+    # Use `fp8_enabled` to select the FP8 SM90 prefill templates (BatchFP8Prefill*)
+    # when Q is FP8. This is required to compile and run the FP8 tensor-core path
+    # on Hopper; the non-FP8 prefill templates may fail for FP8 Q/KV types.
+    fp8_enabled = dtype_q in [torch.float8_e4m3fn, torch.float8_e5m2]
+
     return gen_customize_batch_prefill_module(
         backend,
         uri,
@@ -1114,7 +1126,7 @@ def gen_batch_prefill_attention_sink_module(
         use_sliding_window=use_sliding_window,
         use_logits_soft_cap=False,
         use_fp16_qk_reduction=False,
-        fp8_enabled=False,
+        fp8_enabled=fp8_enabled,
     )
 
 
@@ -1533,6 +1545,25 @@ def gen_customize_batch_prefill_module(
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
         "use_fp16_qk_reduction": str(use_fp16_qk_reduction).lower(),
     }
+
+    # FlashInfer currently generates prefill modules that include *both* paged and ragged
+    # kernel instantiations for all mask modes [0..3]. For the AttentionSink variant we
+    # only use the paged path in SGLang (ragged prefill is explicitly disabled when sinks
+    # are required), and the MultiItemScoring mask mode is not needed for GPT-OSS.
+    #
+    # On SM90 with FP8 KV cache, compiling the unused AttentionSink + MultiItemScoring
+    # kernels can fail (GMMA operator selection), which blocks GPT-OSS FP8 KV runs.
+    # Compile only the required subset to unblock correctness/perf work.
+    mask_modes = [0, 1, 2, 3]
+    emit_ragged = True
+    if variant_name == "AttentionSink":
+        # AttentionSink is used by GPT-OSS in SGLang. SGLang disables ragged prefill for
+        # sink models, and GPT-OSS uses only causal (prefill) and non-causal (decode, q_len=1)
+        # modes. Avoid compiling unnecessary kernels to reduce JIT time/memory and to
+        # sidestep unsupported mask-mode instantiations on SM90.
+        mask_modes = [0, 1]
+        emit_ragged = False
+
     if backend == "auto":
         raise ValueError("backend should not be auto when jit_args is provided")
     elif backend == "fa2":
@@ -1573,7 +1604,7 @@ def gen_customize_batch_prefill_module(
         os.makedirs(gen_directory, exist_ok=True)
 
         source_paths = []
-        for mask_mode in [0, 1, 2, 3]:
+        for mask_mode in mask_modes:
             dest_path = (
                 gen_directory / f"batch_prefill_paged_kernel_mask_{mask_mode}.cu"
             )
@@ -1584,15 +1615,16 @@ def gen_customize_batch_prefill_module(
             )
             write_if_different(dest_path, source)
 
-            dest_path = (
-                gen_directory / f"batch_prefill_ragged_kernel_mask_{mask_mode}.cu"
-            )
-            source_paths.append(dest_path)
-            source = ragged_kernel_inst_templ.render(
-                mask_mode=mask_mode_literal[mask_mode],
-                **kwargs,
-            )
-            write_if_different(dest_path, source)
+            if emit_ragged:
+                dest_path = (
+                    gen_directory / f"batch_prefill_ragged_kernel_mask_{mask_mode}.cu"
+                )
+                source_paths.append(dest_path)
+                source = ragged_kernel_inst_templ.render(
+                    mask_mode=mask_mode_literal[mask_mode],
+                    **kwargs,
+                )
+                write_if_different(dest_path, source)
 
         for filename in [
             "batch_prefill.cu",
@@ -1647,7 +1679,7 @@ def gen_customize_batch_prefill_module(
         generated_inc_str = config_templ.render(**kwargs)
 
         source_paths = []
-        for mask_mode in [0, 1, 2, 3]:
+        for mask_mode in mask_modes:
             filename = f"batch_prefill_paged_sm90_kernel_mask_{mask_mode}.cu"
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
@@ -1657,14 +1689,15 @@ def gen_customize_batch_prefill_module(
             )
             write_if_different(dest_path, source)
 
-            filename = f"batch_prefill_ragged_sm90_kernel_mask_{mask_mode}.cu"
-            dest_path = gen_directory / filename
-            source_paths.append(dest_path)
-            source = ragged_kernel_inst_templ.render(
-                mask_mode=mask_mode_literal[mask_mode],
-                **kwargs,
-            )
-            write_if_different(dest_path, source)
+            if emit_ragged:
+                filename = f"batch_prefill_ragged_sm90_kernel_mask_{mask_mode}.cu"
+                dest_path = gen_directory / filename
+                source_paths.append(dest_path)
+                source = ragged_kernel_inst_templ.render(
+                    mask_mode=mask_mode_literal[mask_mode],
+                    **kwargs,
+                )
+                write_if_different(dest_path, source)
 
         for filename in [
             _file_csrc,

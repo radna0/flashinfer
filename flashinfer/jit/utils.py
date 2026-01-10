@@ -43,10 +43,6 @@ dtype_map = {
     torch.uint64: "uint64_t",
 }
 
-# Add FP4 (E2M1) dtype if available (requires PyTorch with FP4 support)
-if hasattr(torch, "float4_e2m1fn_x2"):
-    dtype_map[torch.float4_e2m1fn_x2] = "__nv_fp4_e2m1"
-
 dtype_cutlass_map = {
     torch.float16: "cutlass::half_t",
     torch.bfloat16: "cutlass::bfloat16_t",
@@ -59,10 +55,6 @@ dtype_cutlass_map = {
     torch.int64: "cutlass::int64_t",
     torch.uint64: "cutlass::uint64_t",
 }
-
-# Add FP4 (E2M1) dtype if available
-if hasattr(torch, "float4_e2m1fn_x2"):
-    dtype_cutlass_map[torch.float4_e2m1fn_x2] = "cutlass::float_e2m1_t"
 
 filename_safe_dtype_map = {
     torch.float16: "f16",
@@ -77,9 +69,13 @@ filename_safe_dtype_map = {
     torch.uint64: "u64",
 }
 
-# Add FP4 (E2M1) dtype if available
+# PyTorch 2.8+ introduces a native packed FP4 dtype. Internally it is stored in a
+# 1-byte container (two FP4 values per byte). FlashInfer attention kernels treat
+# FP4 buffers as byte-packed data, so we map it to the same C++ container type.
 if hasattr(torch, "float4_e2m1fn_x2"):
-    filename_safe_dtype_map[torch.float4_e2m1fn_x2] = "fp4"
+    dtype_map[torch.float4_e2m1fn_x2] = "uint8_t"
+    dtype_cutlass_map[torch.float4_e2m1fn_x2] = "cutlass::uint8_t"
+    filename_safe_dtype_map[torch.float4_e2m1fn_x2] = "e2m1"
 
 pos_encoding_mode_literal = {
     0: "PosEncodingMode::kNone",

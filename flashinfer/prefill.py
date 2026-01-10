@@ -25,12 +25,10 @@ import torch
 from .api_logging import flashinfer_api
 from .jit import (
     gen_batch_prefill_module,
-    gen_batch_prefill_attention_sink_module,
     gen_customize_batch_prefill_module,
     gen_fmha_cutlass_sm100a_module,
     gen_single_prefill_module,
     get_batch_prefill_uri,
-    get_batch_prefill_attention_sink_uri,
     get_single_prefill_uri,
     setup_cubin_loader,
     gen_trtllm_gen_fmha_module,
@@ -225,8 +223,6 @@ def get_trtllm_gen_prefill_module():
         window_left: int = -1,
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
-        k_cache_scales: Optional[torch.Tensor] = None,
-        v_cache_scales: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         sm_count = get_device_sm_count(query.device)
         if out is None:
@@ -260,8 +256,6 @@ def get_trtllm_gen_prefill_module():
             enable_pdl,
             workspace_size,
             sinks,
-            k_cache_scales,
-            v_cache_scales,
         )
         return out
 
@@ -395,23 +389,6 @@ def get_single_prefill_module(backend, *args):
 
     # Register the module
     return SimpleNamespace(run=run_single_prefill)
-
-
-@functools.cache
-def get_batch_prefill_attention_sink_module(backend, *args):
-    uri = get_batch_prefill_attention_sink_uri(backend, *args)
-    module = gen_batch_prefill_attention_sink_module(backend, *args).build_and_load()
-    plan_func = module.plan
-    ragged_run_func = module.ragged_run
-    paged_run_func = module.paged_run
-
-    return SimpleNamespace(
-        module=module,
-        uri=uri,
-        plan=plan_func,
-        ragged_run=ragged_run_func,
-        paged_run=paged_run_func,
-    )
 
 
 @functools.cache
@@ -646,8 +623,6 @@ def get_batch_prefill_module(backend, *args):
         cum_seq_lens_q: Optional[torch.Tensor] = None,
         cum_seq_lens_kv: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
-        k_cache_scales: Optional[torch.Tensor] = None,
-        v_cache_scales: Optional[torch.Tensor] = None,
     ) -> None:
         if backend == "trtllm-gen":
             assert maybe_lse is None
@@ -681,8 +656,6 @@ def get_batch_prefill_module(backend, *args):
                 window_left,
                 out=o,
                 sinks=sinks,
-                k_cache_scales=k_cache_scales,
-                v_cache_scales=v_cache_scales,
             )
         elif backend == "fa2":
             assert not is_float8(q)
@@ -814,9 +787,6 @@ def get_batch_prefill_module(backend, *args):
         batch_size: Optional[int] = None,
         cum_seq_lens_q: Optional[torch.Tensor] = None,
         cum_seq_lens_kv: Optional[torch.Tensor] = None,
-        sinks: Optional[torch.Tensor] = None,
-        k_cache_scales: Optional[torch.Tensor] = None,
-        v_cache_scales: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 
@@ -1732,7 +1702,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
         o_data_type : Optional[Union[str, torch.dtype]]
             The data type of the output tensor. If None, will be set to :attr:`q_data_type`.
-            For FP8 inputs, this should typically be set to torch.float16.
+            For FP8 inputs, this should typically be set to torch.float16 or torch.bfloat16.
         non_blocking : bool
             Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
         prefix_len_ptr :Optional[torch.Tensor]
@@ -1971,9 +1941,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 block_id = paged_kv_indptr_host[0]
                 for i in range(batch_size):
                     num_blocks_needed = blocks_per_seq[i]
-                    assert (
-                        self._block_tables is not None
-                    ), "block_tables is not initialized"
+                    assert self._block_tables is not None, (
+                        "block_tables is not initialized"
+                    )
                     self._block_tables[i, :num_blocks_needed] = paged_kv_indices[
                         block_id : block_id + num_blocks_needed
                     ]
@@ -2034,8 +2004,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
         sinks: Optional[torch.Tensor] = None,
-        k_cache_scales: Optional[torch.Tensor] = None,
-        v_cache_scales: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""Warning: This function is deprecated, please use :meth:`run` instead."""
         self._causal = causal
@@ -2047,13 +2015,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
         return self.run(
-            q,
-            paged_kv_cache,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            sinks=sinks,
-            k_cache_scales=k_cache_scales,
-            v_cache_scales=v_cache_scales,
+            q, paged_kv_cache, k_scale=k_scale, v_scale=v_scale, sinks=sinks
         )
 
     @overload
@@ -2100,8 +2062,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
         return_lse: bool = False,
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
-        k_cache_scales: Optional[torch.Tensor] = None,
-        v_cache_scales: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and paged kv-cache.
@@ -2153,15 +2113,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
-        if (k_cache_scales is not None or v_cache_scales is not None) and (
-            self._backend != "trtllm-gen"
-        ):
-            raise ValueError(
-                "k_cache_scales/v_cache_scales are only supported by trtllm-gen backend."
-            )
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
+        o_dtype = self._cached_o_data_type
+        if out is not None and out.dtype != o_dtype:
+            raise ValueError(
+                f"The dtype of out {out.dtype} does not match the o_data_type {o_dtype} specified in plan function."
+            )
 
         if self._kv_layout == "NHD":
             page_size = k_cache.shape[1]
@@ -2319,15 +2278,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 ]
 
             assert self._cached_module is not None, "cached module is not initialized"
-            if self._backend == "trtllm-gen":
-                run_args += [k_cache_scales, v_cache_scales]
             self._cached_module.paged_run(*run_args)
-            if v_scale is not None:
+
+            is_float_one = isinstance(v_scale, float) and v_scale == 1.0
+            if v_scale is not None and not is_float_one:
                 # TODO(Zihao): fused into kernel
                 if is_float8(out):
                     out = (out.to(torch.float32) * v_scale).to(out.dtype)
                 else:
                     out *= v_scale
+
         return (out, lse) if return_lse else out
 
     run_return_lse = functools.partialmethod(run, return_lse=True)
@@ -2710,7 +2670,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
         o_data_type : Optional[Union[str, torch.dtype]]
             The data type of the output tensor. If None, will be set to :attr:`q_data_type`.
-            For FP8 inputs, this should typically be set to torch.float16.
+            For FP8 inputs, this should typically be set to torch.float16 or torch.bfloat16.
         non_blocking : bool
             Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
         prefix_len_ptr :Optional[torch.Tensor]
@@ -3447,9 +3407,9 @@ def trtllm_ragged_attention_deepseek(
         If return_lse is True, the output will be a tuple of two tensors, the first is the output tensor, the second is the lse tensor.
         If return_lse is False, the output will be a single tensor.
     """
-    assert (
-        query.shape[2] == 192 and key.shape[2] == 192 and value.shape[2] == 128
-    ), "currently only support deepseek r1 192 query and 128 value"
+    assert query.shape[2] == 192 and key.shape[2] == 192 and value.shape[2] == 128, (
+        "currently only support deepseek r1 192 query and 128 value"
+    )
 
     if enable_pdl is None:
         enable_pdl = device_support_pdl(query.device)
@@ -3530,8 +3490,6 @@ def trtllm_batch_context_with_kv_cache(
     kv_layout: str = "HND",
     enable_pdl: Optional[bool] = None,
     sinks: Optional[List[torch.Tensor]] = None,
-    k_cache_scales: Optional[torch.Tensor] = None,
-    v_cache_scales: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -3600,9 +3558,9 @@ def trtllm_batch_context_with_kv_cache(
         if kv_cache.shape[1] == 1:
             k_cache, v_cache = kv_cache, kv_cache
         else:
-            assert (
-                kv_cache.shape[1] == 2
-            ), "When kv_cache is a single tensor, the second dimension must be 1 or 2"
+            assert kv_cache.shape[1] == 2, (
+                "When kv_cache is a single tensor, the second dimension must be 1 or 2"
+            )
             # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
@@ -3617,9 +3575,9 @@ def trtllm_batch_context_with_kv_cache(
     sm_count = get_device_sm_count(query.device)
 
     if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
-        assert (
-            query.dtype == torch.float8_e4m3fn
-        ), "query must be fp8 when out_dtype is nvfp4."
+        assert query.dtype == torch.float8_e4m3fn, (
+            "query must be fp8 when out_dtype is nvfp4."
+        )
         assert o_sf_scale is not None
         assert o_sf_vec_size in [None, 16], "only o_sf_vec_size = 16 is supported"
         o_sf_vec_size = o_sf_vec_size or 16
@@ -3718,8 +3676,6 @@ def trtllm_batch_context_with_kv_cache(
         enable_pdl,
         workspace_size,
         sinks,
-        k_cache_scales,
-        v_cache_scales,
     )
     return (
         out
@@ -3779,9 +3735,9 @@ def fmha_v2_prefill_deepseek(
     """
     if not is_sm120a_supported(query.device):
         raise ValueError("fmha_v2_prefill_deepseek is only supported on SM120 GPUs.")
-    assert (
-        query.shape[3] == 192 and key.shape[3] == 192 and value.shape[3] == 128
-    ), "currently only support deepseek r1 192 query and 128 value"
+    assert query.shape[3] == 192 and key.shape[3] == 192 and value.shape[3] == 128, (
+        "currently only support deepseek r1 192 query and 128 value"
+    )
     module = get_trtllm_fmha_v2_module()
     is_e4m3 = query.dtype == torch.float8_e4m3fn
     is_bf16_output = out.dtype == torch.bfloat16

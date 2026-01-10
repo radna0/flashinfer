@@ -467,10 +467,29 @@ def gen_jit_spec(
 
 
 def get_tmpdir() -> Path:
-    # TODO(lequn): Try /dev/shm first. This should help Lock on NFS.
+    # IMPORTANT: FlashInfer JIT locks can hang on network filesystems (e.g. NFS).
+    # Prefer a local tmpfs (/dev/shm) for lock files and aggregate ninja manifests.
+    # The compiled artifacts still live under FLASHINFER_JIT_DIR (which may be on NFS).
+    env_tmpdir = os.environ.get("FLASHINFER_JIT_TMPDIR")
+    if env_tmpdir:
+        candidates = [Path(env_tmpdir)]
+    else:
+        candidates = [
+            Path("/dev/shm") / "flashinfer_jit_tmp",
+            Path("/tmp") / "flashinfer_jit_tmp",
+            jit_env.FLASHINFER_JIT_DIR / "tmp",
+        ]
+
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+        except Exception:
+            continue
+
+    # Last resort: use the JIT dir itself (should be rare).
     tmpdir = jit_env.FLASHINFER_JIT_DIR / "tmp"
-    if not tmpdir.exists():
-        tmpdir.mkdir(parents=True, exist_ok=True)
+    tmpdir.mkdir(parents=True, exist_ok=True)
     return tmpdir
 
 

@@ -726,8 +726,8 @@ __launch_bounds__(128 * 3)
   auto const warpIdx = getWarpIdx(uint3{128, 1, 3});
   auto const wid = warpIdx.z * 4 + warpIdx.x;
   if (wid == 0 && warpElectSync()) {
-    tma::prefetchTensorMap(tensorMapVLLMK, StateSpace::kPARAMETER);
-    tma::prefetchTensorMap(tensorMapVLLMV, StateSpace::kPARAMETER);
+    tma::prefetchTensorMap(tensorMapVLLMK);
+    tma::prefetchTensorMap(tensorMapVLLMV);
   }
   extern __shared__ char smemByteBuf[];
   assert(dynamicSmemSize() >= sizeof(SharedMem));
@@ -1716,14 +1716,12 @@ __device__ inline void KVTilePartLoader::loadData(
     assert(nbPagesPerTile == 1);
     uint32_t const offset = nbTokens * (idxTile % exactDiv(tokensPerPage, nbTokens));
     tma::loadAsync(&dst, tensorMap,
-                   DimsLE<4>{partElems * idxPart, idxHeadGrp, offset, (uint32_t)pages[0]}, bar,
-                   StateSpace::kPARAMETER);
+                   DimsLE<4>{partElems * idxPart, idxHeadGrp, offset, (uint32_t)pages[0]}, bar);
   } else {
 #pragma unroll
     for (uint32_t i = 0; i < nbPagesPerTile; i++) {
       tma::loadAsync(&dst(tokensPerPage * i, 0), tensorMap,
-                     DimsLE<4>{partElems * idxPart, idxHeadGrp, 0, (uint32_t)pages[i]}, bar,
-                     StateSpace::kPARAMETER);
+                     DimsLE<4>{partElems * idxPart, idxHeadGrp, 0, (uint32_t)pages[i]}, bar);
     }
   }
 }

@@ -37,7 +37,29 @@ using namespace cute;
 template <int CTA_Q, int CTA_KV>
 CUTLASS_DEVICE int get_swa_begin_kv_tile_idx(int window_left, int q_tile_idx, const int qo_len,
                                              const int kv_len) {
-  return std::max((q_tile_idx * CTA_Q + kv_len - qo_len - window_left) / CTA_KV - 1, 0);
+  // Compute the first KV tile that can contribute under left sliding-window masking.
+  //
+  // For a query index `qo_idx`, valid keys satisfy:
+  //   kv_idx >= qo_idx + kv_len - qo_len - window_left
+  //
+  // For the earliest query in this Q tile, let:
+  //   lb = q_tile_idx * CTA_Q + kv_len - qo_len - window_left
+  //
+  // Any KV tile whose max index ((tile + 1) * CTA_KV - 1) is < lb is fully masked for *all*
+  // queries in the tile and can be skipped. The first potentially-valid tile is:
+  //   begin = ceil((lb + 1) / CTA_KV) - 1
+  //
+  // Using an overly-conservative begin (too small) can cause producer/consumer pipeline
+  // mismatches in FP8 SM90 prefill (producer loads a fully-masked tile that consumer never
+  // consumes), leading to a deadlock on long sequences.
+  int64_t lb = static_cast<int64_t>(q_tile_idx) * CTA_Q +
+               static_cast<int64_t>(kv_len) - static_cast<int64_t>(qo_len) -
+               static_cast<int64_t>(window_left);
+  if (lb <= 0) {
+    return 0;
+  }
+  int64_t begin = (lb + CTA_KV) / CTA_KV - 1;
+  return begin > 0 ? static_cast<int>(begin) : 0;
 }
 
 template <int CTA_Q, int CTA_KV>

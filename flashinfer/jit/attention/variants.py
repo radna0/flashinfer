@@ -54,6 +54,15 @@ struct AttentionSink : AttentionVariantBase {
 
 attention_sink_fa3_decl = r"""
 
+// Needed for FP8 kernel path:
+// - get_{q,k,v}_scale helpers
+// - scale handling conventions (scale_pv semantics)
+// - compatibility with quantization mainloop expectations (PQuantize/ODequantize)
+// Note: BF16 prefill path already indirectly includes this via prefill_sm90.cuh, but
+// the FP8 prefill path includes quantization/prefill_sm90.cuh which does not.
+// Include explicitly to keep the custom AttentionSink variant self-contained.
+#include <flashinfer/attention/hopper/variants.cuh>
+
 template <int NUM_ROWS_PER_THREAD>
 struct OnlineSoftmaxWithSink {
   constexpr static float fill_value = -math::inf;
@@ -142,17 +151,35 @@ struct OnlineSoftmaxWithSink {
 struct AttentionSink : AttentionVariantBase {
   float sm_scale_log2;
   float log_sink;
+  float p_scale;
   float scale_pv;
   int qo_len, kv_len;
 
   // Init
   template <typename MainloopParams, typename BlockCoord>
   __device__ __host__ AttentionSink(const MainloopParams& params, const BlockCoord& block_coord) {
-    sm_scale_log2 = params.additional_params.sm_scale * math::log2e;
     auto [_, qo_head_idx, kv_head_idx, ___, ____, qo_len_, kv_len_, batch_idx] =
         block_coord;
+    float q_scale = get_q_scale(params.additional_params, qo_head_idx);
+    float k_scale = get_k_scale(params.additional_params, kv_head_idx);
+    sm_scale_log2 = q_scale * k_scale * params.additional_params.sm_scale * math::log2e;
     log_sink = params.additional_params.sink[qo_head_idx] * math::log2e;
-    scale_pv = get_v_scale(params.additional_params, kv_head_idx);
+    float v_scale = get_v_scale(params.additional_params, kv_head_idx);
+
+    // For FP8 kernels, attention probabilities are quantized to FP8 before the PV GEMM.
+    // Match StandardFP8Attention's convention: PQuantize multiplies by p_scale (max FP8),
+    // and the online softmax finalize applies scale_pv = v_scale / p_scale.
+    //
+    // For non-FP8 kernels, p_scale must be 1 and scale_pv should be the (optional) v_scale.
+    using DTypeKV = std::remove_const_t<std::remove_pointer_t<decltype(params.K_ptr)>>;
+    if constexpr (std::is_same_v<DTypeKV, cutlass::float_e4m3_t> ||
+                  std::is_same_v<DTypeKV, cutlass::float_e5m2_t>) {
+      p_scale = std::numeric_limits<DTypeKV>::max();
+      scale_pv = v_scale / p_scale;
+    } else {
+      p_scale = 1.0f;
+      scale_pv = v_scale;
+    }
 
     qo_len = qo_len_;
     kv_len = kv_len_;
@@ -161,6 +188,20 @@ struct AttentionSink : AttentionVariantBase {
   template <int NUM_ROWS_PER_THREAD>
   __device__ auto GetAttentionUpdater() {
     return OnlineSoftmaxWithSink<NUM_ROWS_PER_THREAD>(sm_scale_log2, log_sink);
+  }
+
+  template <typename Tensor0>
+  __device__ __forceinline__ void PQuantize(Tensor0& tSrS) {
+#pragma unroll
+    for (int i = 0; i < size(tSrS); ++i) {
+      tSrS(i) *= p_scale;
+    }
+  }
+
+  template <typename MainloopParams, typename Tensor0>
+  __device__ __forceinline__ void ODequantize(const MainloopParams& params, Tensor0& tOrO,
+                                              uint32_t qo_head_idx, uint32_t kv_head_idx) {
+    // PV dequantization is fused into OnlineSoftmaxWithSink::finalize via scale_pv.
   }
 };
 """

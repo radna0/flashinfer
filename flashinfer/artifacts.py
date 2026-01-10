@@ -87,7 +87,7 @@ class ArtifactPath:
     When compiling new cubins for backend directories, update the corresponding path.
     """
 
-    TRTLLM_GEN_FMHA: str = "9f1b6ddaa1592a8339a82fcab7d27a57eff445fd/fmha/trtllm-gen/"
+    TRTLLM_GEN_FMHA: str = "75d477a640f268ea9ad117cc596eb39245713b9e/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
         "ccae3ed120a12a2c6922b458086b460413dbf731/batched_gemm-0d275a2-9936841"
     )
@@ -107,7 +107,7 @@ class CheckSumHash:
     """
 
     TRTLLM_GEN_FMHA: str = (
-        "a5a60600a80076317703695f56bbef2f0a44075ef4e24d7b06ba67ff68bc9da2"
+        "e014d7a54c396733ef012b223603c1be2861019f88faa5dcc882ed1ecfe5c2d9"
     )
     TRTLLM_GEN_BMM: str = (
         "b7689d3046493806251351c2744c6d7faed6af25518647a955b35c4919b014fc"
@@ -146,6 +146,59 @@ def get_checksums(subdirs):
 def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
     base = FLASHINFER_CUBINS_REPOSITORY
 
+    def _allowed_sm_versions() -> set[str]:
+        """
+        Optional download filter for FlashInfer cubins.
+
+        If `FLASHINFER_CUDA_ARCH_LIST` is set (e.g. "90" or "90 90a"), we only
+        download cubins whose filenames indicate those SM versions (e.g. "Sm90",
+        "Sm90a"). This keeps container builds smaller/faster when targeting a
+        single architecture like H100 (sm90).
+        """
+
+        arch_list = os.environ.get("FLASHINFER_CUDA_ARCH_LIST", "").strip()
+        if not arch_list:
+            return set()
+
+        allowed: set[str] = set()
+        for token in re.split(r"[ ,]+", arch_list):
+            token = token.strip().lower()
+            if not token:
+                continue
+            token = token.removeprefix("compute_").removeprefix("sm")
+            # Accept both "90"/"90a" and "9.0"/"9.0a" forms.
+            m = re.fullmatch(r"(\d+)([a-z]?)", token)
+            if m:
+                allowed.add(m.group(1) + m.group(2))
+                continue
+            m = re.fullmatch(r"(\d+)\.(\d+)([a-z]?)", token)
+            if m:
+                allowed.add(m.group(1) + m.group(2) + m.group(3))
+        return allowed
+
+    allowed_sms = _allowed_sm_versions()
+
+    def _should_download_cubin(filename: str) -> bool:
+        if not allowed_sms:
+            return True
+
+        # Only filter if the filename encodes an SM target.
+        m = re.search(r"[Ss]m(\d+)([a-z]?)", filename)
+        if not m:
+            return True
+
+        sm = m.group(1)
+        suffix = m.group(2)
+
+        # If "90" is allowed, also accept "90a" unless explicitly restricted.
+        if sm in allowed_sms:
+            return True
+        if suffix and (sm + suffix) in allowed_sms:
+            return True
+        if (sm in allowed_sms) and suffix:
+            return True
+        return False
+
     cubin_dirs = [
         ArtifactPath.TRTLLM_GEN_FMHA,
         ArtifactPath.TRTLLM_GEN_BMM,
@@ -181,6 +234,8 @@ def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
         checksum_path = safe_urljoin(cubin_dir, "checksums.txt")
         yield (checksum_path, CheckSumHash.map_checksums[checksum_path])
         for name in get_available_cubin_files(safe_urljoin(base, cubin_dir)):
+            if not _should_download_cubin(name):
+                continue
             yield (safe_urljoin(cubin_dir, name), checksums[name])
 
 

@@ -225,10 +225,20 @@ class BatchAttentionWithAttentionSinkWrapper(BatchPrefillWithPagedKVCacheWrapper
         use_fp16_qk_reduction: bool = False,
         q_data_type: torch.dtype = torch.bfloat16,
         kv_data_type: torch.dtype = torch.bfloat16,
+        o_data_type: Optional[torch.dtype] = None,
         head_dim_qk: int = 128,
         head_dim_vo: int = 128,
         window_left: int = -1,
     ) -> None:
+        fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+        if o_data_type is None:
+            # AttentionSink kernels do not currently support FP8 output reliably.
+            # Default to BF16 output when operating in FP8 Q/KV mode.
+            o_data_type = torch.bfloat16 if q_data_type in fp8_dtypes else q_data_type
+        elif o_data_type in fp8_dtypes:
+            # Prevent CUTLASS/Cute epilogue/copy layout issues when `dtype_o` is FP8.
+            # Callers can still quantize the output explicitly if desired.
+            o_data_type = torch.bfloat16
         # trtllm is separate code path
         assert backend in ["fa2", "fa3", "auto"]
         if backend == "auto":
@@ -243,10 +253,16 @@ class BatchAttentionWithAttentionSinkWrapper(BatchPrefillWithPagedKVCacheWrapper
             )
 
         jit_args = [
-            f"batch_prefill_attention_sink_{filename_safe_dtype_map[q_data_type]}_swa_{window_left >= 0}_{backend}",  # uri
+            (
+                "batch_prefill_attention_sink_"
+                f"{filename_safe_dtype_map[q_data_type]}_"
+                f"kv_{filename_safe_dtype_map[kv_data_type]}_"
+                f"o_{filename_safe_dtype_map[o_data_type]}_"
+                f"swa_{window_left >= 0}_{backend}"
+            ),  # uri
             q_data_type,  # dtype_q
             kv_data_type,  # dtype_kv
-            q_data_type,  # dtype_o
+            o_data_type,  # dtype_o
             torch.int32,  # idtype
             head_dim_qk,  # hidden_dim_qk
             head_dim_vo,  # hidden_dim_vo
@@ -261,6 +277,11 @@ class BatchAttentionWithAttentionSinkWrapper(BatchPrefillWithPagedKVCacheWrapper
             "use_sliding_window": window_left >= 0,
             "use_fp16_qk_reduction": use_fp16_qk_reduction,
             "pos_encoding_mode": PosEncodingMode[pos_encoding_mode].value,
+            # IMPORTANT: Use the FP8-specific SM90 prefill templates when Q is FP8.
+            # Without this, custom AttentionSink JIT modules route through the non-FP8
+            # Hopper prefill path and can fail to compile (GMMA layout assertions).
+            "fp8_enabled": backend == "fa3"
+            and q_data_type in [torch.float8_e4m3fn, torch.float8_e5m2],
         }
 
         super().__init__(
@@ -276,4 +297,54 @@ class BatchAttentionWithAttentionSinkWrapper(BatchPrefillWithPagedKVCacheWrapper
             backend=backend,
             jit_args=jit_args,
             jit_kwargs=jit_kwargs,
+        )
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        causal: bool = False,
+        pos_encoding_mode: str = "NONE",
+        use_fp16_qk_reduction: bool = False,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        window_left: int = -1,
+        logits_soft_cap: Optional[float] = None,
+        sm_scale: Optional[float] = None,
+        rope_scale: Optional[float] = None,
+        rope_theta: Optional[float] = None,
+        sinks: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # NOTE: This wrapper uses a custom JIT module that expects additional arguments
+        # (sink tensor + sm_scale scalar) passed via `*args` to `run()`.
+        self._causal = causal
+        self._pos_encoding_mode = pos_encoding_mode
+        self._use_fp16_qk_reduction = use_fp16_qk_reduction
+        self._window_left = window_left
+        self._logits_soft_cap = logits_soft_cap
+        self._sm_scale = sm_scale
+        self._rope_scale = rope_scale
+        self._rope_theta = rope_theta
+
+        if sinks is None:
+            raise ValueError("Attention sink wrapper requires `sinks`.")
+
+        sm_scale_val = (
+            float(sm_scale)
+            if sm_scale is not None
+            else 1.0 / math.sqrt(q.size(-1))
+        )
+        # NOTE: BatchPrefillWithPagedKVCacheWrapper.run() folds FP8 calibration scales into
+        # `sm_scale` (sm_scale *= q_scale * k_scale). For AttentionSink we pass `sm_scale`
+        # as a positional JIT arg, so we must apply the same folding here.
+        if k_scale is not None:
+            sm_scale_val *= float(k_scale)
+
+        return super().run(
+            q,
+            paged_kv_cache,
+            sinks,
+            sm_scale_val,
+            k_scale=None,
+            v_scale=v_scale,
         )

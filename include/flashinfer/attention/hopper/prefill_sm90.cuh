@@ -518,9 +518,24 @@ constexpr auto getCTATileSize() {
       return std::make_tuple(128, 64);
     }
   } else {
-    // NOTE(Zihao) hack for deepseek prefill
-    static_assert(HEAD_DIM_QK == 192 && HEAD_DIM_VO == 128);
-    return std::make_tuple(128, 128);
+    // Non-square head dims (QK != VO). This is required by MLA-style models where the
+    // value head dimension can be smaller than the QK head dimension.
+    //
+    // Supported pairs:
+    // - (192, 128): DeepSeek prefill tuning.
+    // - (128,  64): GPT-OSS MLA.
+    static_assert((HEAD_DIM_QK == 192 && HEAD_DIM_VO == 128) ||
+                      (HEAD_DIM_QK == 128 && HEAD_DIM_VO == 64),
+                  "Unsupported non-square (HEAD_DIM_QK, HEAD_DIM_VO) pair for SM90 prefill.");
+    if constexpr (HEAD_DIM_QK == 128 && HEAD_DIM_VO == 64) {
+      if constexpr (CAUSAL) {
+        return std::make_tuple(128, 128);
+      } else {
+        return std::make_tuple(128, 192);
+      }
+    } else {
+      return std::make_tuple(128, 128);
+    }
   }
 }
 
@@ -577,11 +592,13 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
   constexpr bool MULTIITEMSCORING = MASK_MODE == MaskMode::kMultiItemScoring;
   if constexpr (HEAD_DIM_QK == HEAD_DIM_VO) {
     if constexpr (HEAD_DIM_VO == 64) {
-      // NOTE(Zihao): CTA_KV not tuned for HEAD_DIM == 64, need to optimize later
+      // NOTE: The previous (CTA_Q=192, CTA_KV=96) configuration is prone to
+      // pathological behavior for some long-sequence FP8 prefill workloads.
+      // Use the same CTA_KV as getCTATileSize() for HEAD_DIM==64.
       BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
           AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM_QK, HEAD_DIM_VO,
                                 /*CTA_Q_=*/192,
-                                /*CTA_KV_=*/96,
+                                /*CTA_KV_=*/128,
                                 /*NUM_STAGES_=*/2, typename Params::DTypeQ,
                                 typename Params::DTypeKV, typename Params::DTypeO,
                                 typename Params::IdType, AttentionVariant>,
